@@ -1,5 +1,5 @@
 # hd-map-runtime
-This project touches on the fundamentals of a moderns ADAS/Autonomy system.
+This project touches on the fundamentals of a modern ADAS/Autonomy system.
 
 Problem Statement
 Modern autonomous vehicles require HD maps that are accurate, lightweight, and continuously up to date. This project tackles three interconnected runtime challenges:
