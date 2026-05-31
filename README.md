@@ -13,6 +13,11 @@ A production fleet cannot rely on manual map updates. This component implements 
 Problem 3: Map Localization C++
 With an updated compressed map onboard, the vehicle must find itself with in the map. This component fuses the vehicle's real-time pose with the compressed SQLite database (Problem 1) to localize the vehicle and surface the lane geometry immediately relevant to its current position.
 
+## Documentation
+- [Database Design](docs/database-design.md)
+- [Architecture](docs/architecture.md)
+- [ADR-001](docs/adr/001-sqlite-over-flatfiles.md)
+
 System architecture diagram
 
 ```mermaid
