@@ -16,7 +16,7 @@ With an updated compressed map onboard, the vehicle must find itself with in the
 ## Documentation
 - [Database Design](docs/database-design.md)
 - [Architecture](docs/architecture.md)
-- [ADR-001](docs/adr/001-sqlite-over-flatfiles.md)
+- [SQLite Schema Definition](docs/adr/001-sqlite-over-flatfiles.md)
 
 System architecture diagram
 
