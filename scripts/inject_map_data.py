@@ -1,0 +1,677 @@
+"""
+inject_map_data.py
+
+Injects a fully connected HD map road network into an existing SQLite database
+created by generate_database_schema.py.
+
+All coordinates are stored in WGS84 (EPSG:4326) decimal degrees with a minimum
+of 6 decimal places — consistent with industry HD map formats (NDS, OpenDRIVE).
+Point density is 1 point per metre along every centreline and paint line,
+providing the resolution required by the map compression algorithm.
+
+Road Network (anchored at SF Market St & 5th St):
+    Segment 1 — Straight, 300 m, heading north
+    Segment 2 — Right-hand curve, 150 m radius, 90° arc (north → east)
+    Segment 3 — Straight, 300 m, heading east
+
+Cross-section (left to right when facing direction of travel):
+    Left shoulder  | 2.5 m | solid_white left,  dashed_white right
+    Driving lane 1 | 3.7 m | dashed_white both sides
+    Driving lane 2 | 3.7 m | dashed_white both sides
+    Driving lane 3 | 3.7 m | dashed_white left, solid_white right
+    Right shoulder | 2.5 m | dashed_white left, solid_white right
+
+Usage:
+    # Step 1 — create schema (if not already done)
+    python scripts/generate_database_schema.py --output sample_map.db
+
+    # Step 2 — inject data
+    python scripts/inject_map_data.py --db sample_map.db
+"""
+
+import sqlite3
+import argparse
+import math
+from datetime import datetime, timezone
+
+
+# ---------------------------------------------------------------------------
+# WGS84 Constants
+# ---------------------------------------------------------------------------
+
+# Earth's mean radius in metres (WGS84 spherical approximation)
+WGS84_RADIUS_M = 6_378_137.0
+
+
+# ---------------------------------------------------------------------------
+# WGS84 Geometry Utilities
+# ---------------------------------------------------------------------------
+
+def offset_wgs84(lat: float, lon: float, bearing_deg: float, distance_m: float) -> tuple[float, float]:
+    """
+    Move a WGS84 coordinate by a given distance along a given bearing.
+
+    Uses the spherical Earth direct formula (Vincenty simplified), which is
+    accurate to within ~0.3% at road-scale distances — sufficient for HD map
+    injection. For sub-centimetre accuracy a full ellipsoidal solution would
+    be required.
+
+    Args:
+        lat         : origin latitude  (decimal degrees)
+        lon         : origin longitude (decimal degrees)
+        bearing_deg : direction of travel (degrees clockwise from north)
+        distance_m  : distance to travel (metres)
+
+    Returns:
+        (new_lat, new_lon) rounded to 8 decimal places
+    """
+    bearing_rad = math.radians(bearing_deg)
+    lat_rad = math.radians(lat)
+    lon_rad = math.radians(lon)
+    d = distance_m / WGS84_RADIUS_M  # angular distance in radians
+
+    new_lat_rad = math.asin(
+        math.sin(lat_rad) * math.cos(d) +
+        math.cos(lat_rad) * math.sin(d) * math.cos(bearing_rad)
+    )
+    new_lon_rad = lon_rad + math.atan2(
+        math.sin(bearing_rad) * math.sin(d) * math.cos(lat_rad),
+        math.cos(d) - math.sin(lat_rad) * math.sin(new_lat_rad)
+    )
+
+    # Round to 8 decimal places — ~1 mm precision in WGS84
+    return round(math.degrees(new_lat_rad), 8), round(math.degrees(new_lon_rad), 8)
+
+
+def perpendicular_bearing(bearing_deg: float, side: str) -> float:
+    """
+    Return the bearing 90° to the left or right of a travel bearing.
+
+    Args:
+        bearing_deg : forward travel bearing (degrees clockwise from north)
+        side        : 'left' or 'right'
+
+    Returns:
+        Perpendicular bearing in degrees [0, 360)
+    """
+    offset = -90.0 if side == "left" else 90.0
+    return (bearing_deg + offset) % 360.0
+
+
+# ---------------------------------------------------------------------------
+# Geometry Point Generators
+# ---------------------------------------------------------------------------
+
+def straight_centreline_points(
+    start_lat: float,
+    start_lon: float,
+    bearing_deg: float,
+    length_m: float,
+) -> list[tuple[float, float, float]]:
+    """
+    Generate WGS84 centreline points for a straight road segment.
+
+    Points are spaced every 1 metre (floor(length_m) + 1 points total),
+    satisfying the compression algorithm's input density requirement.
+
+    Returns:
+        List of (lat, lon, station_m) tuples ordered from start to end.
+    """
+    n_points = int(length_m) + 1
+    points = []
+    for i in range(n_points):
+        dist = float(i)
+        lat, lon = offset_wgs84(start_lat, start_lon, bearing_deg, dist)
+        points.append((lat, lon, dist))
+    return points
+
+
+def arc_centreline_points(
+    start_lat: float,
+    start_lon: float,
+    start_bearing_deg: float,
+    turn_angle_deg: float,
+    radius_m: float,
+) -> tuple[list[tuple[float, float, float]], float, float, float]:
+    """
+    Generate WGS84 centreline points along a circular arc.
+
+    The centre of curvature sits perpendicular to the travel direction at
+    a distance equal to the radius. Points are generated by sweeping from
+    the start angle to the end angle around the centre, then projecting
+    each point outward by the radius — preserving 1 m spacing along the arc.
+
+    Args:
+        start_lat/lon     : arc start coordinate (WGS84)
+        start_bearing_deg : travel bearing at the start of the arc
+        turn_angle_deg    : total arc turn (positive = right, negative = left)
+        radius_m          : curve radius in metres
+
+    Returns:
+        (points, end_lat, end_lon, end_bearing_deg)
+        where points is a list of (lat, lon, station_m) tuples
+    """
+    # The centre of curvature is 90° to the right (or left) of travel
+    centre_side = "right" if turn_angle_deg > 0 else "left"
+    centre_bearing = perpendicular_bearing(start_bearing_deg, centre_side)
+    centre_lat, centre_lon = offset_wgs84(start_lat, start_lon, centre_bearing, radius_m)
+
+    # Arc length and 1 m point spacing
+    arc_length_m = abs(math.radians(turn_angle_deg)) * radius_m
+    n_points = int(arc_length_m) + 1
+
+    # Bearing from centre back to the start point (opposite of centre_bearing)
+    back_bearing = (centre_bearing + 180.0) % 360.0
+
+    points = []
+    for i in range(n_points):
+        # Fraction along the arc (0.0 = start, 1.0 = end)
+        t = i / max(n_points - 1, 1)
+        angle_swept = t * turn_angle_deg
+
+        # Rotate the back-bearing around the centre by the swept angle
+        # Positive turn_angle sweeps clockwise (right turn), negative counter-clockwise
+        point_bearing = (back_bearing + angle_swept) % 360.0
+        lat, lon = offset_wgs84(centre_lat, centre_lon, point_bearing, radius_m)
+        station = t * arc_length_m
+        points.append((lat, lon, station))
+
+    end_lat, end_lon, _ = points[-1]
+    end_bearing = (start_bearing_deg + turn_angle_deg) % 360.0
+
+    return points, end_lat, end_lon, end_bearing
+
+
+def offset_centreline(
+    centre_points: list[tuple[float, float, float]],
+    travel_bearings: list[float],
+    offset_m: float,
+    side: str,
+) -> list[tuple[float, float]]:
+    """
+    Offset a centreline laterally to produce a paint line boundary.
+
+    Each centreline point is shifted perpendicular to the local travel
+    bearing by offset_m metres. For straight sections all bearings are
+    identical; for curves each point has a unique tangent bearing.
+
+    Args:
+        centre_points   : list of (lat, lon, station) centreline points
+        travel_bearings : per-point travel bearing (same length as centre_points)
+        offset_m        : lateral distance in metres (always positive)
+        side            : 'left' or 'right' — determines direction of offset
+
+    Returns:
+        List of (lat, lon) boundary points.
+    """
+    result = []
+    perp_side = perpendicular_bearing  # alias for readability
+    for (lat, lon, _), bearing in zip(centre_points, travel_bearings):
+        pb = perp_side(bearing, side)
+        new_lat, new_lon = offset_wgs84(lat, lon, pb, offset_m)
+        result.append((new_lat, new_lon))
+    return result
+
+
+def straight_bearings(bearing_deg: float, n: int) -> list[float]:
+    """Return a list of n identical bearings for a straight segment."""
+    return [bearing_deg] * n
+
+
+def arc_bearings(
+    start_bearing_deg: float,
+    turn_angle_deg: float,
+    n: int,
+) -> list[float]:
+    """
+    Return per-point tangent bearings along a circular arc.
+
+    The tangent at each arc point is perpendicular to the radius at that
+    point — equivalent to the start bearing rotated by the angle swept so far.
+    """
+    return [
+        (start_bearing_deg + (i / max(n - 1, 1)) * turn_angle_deg) % 360.0
+        for i in range(n)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Geohash Utilities
+# ---------------------------------------------------------------------------
+
+# Standard base32 alphabet used in geohash encoding
+GEOHASH_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def encode_geohash(lat: float, lon: float, precision: int = 6) -> str:
+    """
+    Encode a WGS84 coordinate into a geohash string.
+
+    Precision 6 ≈ 1.2 km × 0.6 km cell size — suitable for eHorizon
+    tile-based lane lookups at highway and urban speeds.
+    """
+    min_lat, max_lat = -90.0, 90.0
+    min_lon, max_lon = -180.0, 180.0
+    bits, even = [], True
+
+    while len(bits) < precision * 5:
+        if even:
+            mid = (min_lon + max_lon) / 2
+            if lon >= mid:
+                bits.append(1); min_lon = mid
+            else:
+                bits.append(0); max_lon = mid
+        else:
+            mid = (min_lat + max_lat) / 2
+            if lat >= mid:
+                bits.append(1); min_lat = mid
+            else:
+                bits.append(0); max_lat = mid
+        even = not even
+
+    geohash = ""
+    for i in range(0, len(bits), 5):
+        chunk = bits[i:i + 5]
+        index = sum(b << (4 - j) for j, b in enumerate(chunk))
+        geohash += GEOHASH_BASE32[index]
+    return geohash
+
+
+def geohash_bounds(geohash: str) -> tuple[float, float, float, float]:
+    """
+    Decode a geohash string into its bounding box.
+
+    Returns:
+        (min_lon, min_lat, max_lon, max_lat) — i.e. (min_x, min_y, max_x, max_y)
+    """
+    min_lat, max_lat = -90.0, 90.0
+    min_lon, max_lon = -180.0, 180.0
+    even = True
+
+    for char in geohash:
+        index = GEOHASH_BASE32.index(char)
+        for bit in [4, 3, 2, 1, 0]:
+            b = (index >> bit) & 1
+            if even:
+                mid = (min_lon + max_lon) / 2
+                min_lon, max_lon = (mid, max_lon) if b else (min_lon, mid)
+            else:
+                mid = (min_lat + max_lat) / 2
+                min_lat, max_lat = (mid, max_lat) if b else (min_lat, mid)
+            even = not even
+
+    return min_lon, min_lat, max_lon, max_lat
+
+
+# ---------------------------------------------------------------------------
+# Database Insertion Helpers
+# ---------------------------------------------------------------------------
+
+def insert_paint_line(
+    cursor: sqlite3.Cursor,
+    line_type: str,
+    points: list[tuple[float, float]],  # (lat, lon)
+    length_m: float,
+) -> int:
+    """
+    Insert a PAINT_LINE row and all its PAINT_LINE_POINT rows.
+
+    Args:
+        cursor    : active database cursor
+        line_type : must match PAINT_LINE CHECK constraint
+        points    : ordered (lat, lon) boundary points at 1 m spacing
+        length_m  : total arc length of the line in metres
+
+    Returns:
+        The rowid of the new PAINT_LINE row.
+    """
+    cursor.execute(
+        "INSERT INTO PAINT_LINE (type, length) VALUES (?, ?)",
+        (line_type, round(length_m, 4))
+    )
+    line_id = cursor.lastrowid
+
+    # Insert all boundary points — x = lon, y = lat (WGS84 convention)
+    cursor.executemany(
+        "INSERT INTO PAINT_LINE_POINT "
+        "(paint_line_id, sequence_number, x, y, z) VALUES (?, ?, ?, ?, ?)",
+        [(line_id, seq, lon, lat, 0.0) for seq, (lat, lon) in enumerate(points)]
+    )
+    return line_id
+
+
+def insert_lane(
+    cursor: sqlite3.Cursor,
+    centre_points: list[tuple[float, float, float]],  # (lat, lon, station)
+    left_points: list[tuple[float, float]],
+    right_points: list[tuple[float, float]],
+    left_paint_type: str,
+    right_paint_type: str,
+    lane_type: str,
+    length_m: float,
+) -> int:
+    """
+    Insert a complete lane: both paint lines and the centreline.
+
+    Inserts PAINT_LINE + PAINT_LINE_POINT rows for left and right boundaries,
+    then the LANE row linking them, then LANE_CENTER_POINT rows for the
+    centreline with cumulative station distances.
+
+    Returns:
+        The rowid of the new LANE row.
+    """
+    left_id  = insert_paint_line(cursor, left_paint_type,  left_points,  length_m)
+    right_id = insert_paint_line(cursor, right_paint_type, right_points, length_m)
+
+    cursor.execute(
+        "INSERT INTO LANE (right_paint_line_id, left_paint_line_id, length, lane_type) "
+        "VALUES (?, ?, ?, ?)",
+        (right_id, left_id, round(length_m, 4), lane_type)
+    )
+    lane_id = cursor.lastrowid
+
+    # Insert centreline points — x = lon, y = lat (WGS84)
+    cursor.executemany(
+        "INSERT INTO LANE_CENTER_POINT "
+        "(lane_id, sequence_number, x, y, z, station) VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (lane_id, seq, lon, lat, 0.0, round(station, 4))
+            for seq, (lat, lon, station) in enumerate(centre_points)
+        ]
+    )
+    return lane_id
+
+
+def assign_lane_to_tiles(
+    cursor: sqlite3.Cursor,
+    lane_id: int,
+    points: list[tuple[float, float, float]],  # (lat, lon, station)
+    precision: int = 6,
+) -> None:
+    """
+    Assign a lane to every geohash tile its centreline points fall within.
+
+    Iterates every centreline point, computes its geohash, and upserts a
+    GEOHASH_TILE row and a GEOHASH_TILE_LANE join row. A lane spanning a tile
+    boundary will be correctly registered in all intersected tiles.
+
+    Using INSERT OR IGNORE on both tables means this function is idempotent —
+    safe to call even if some tiles already exist from prior lanes.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    seen_geohashes: set[str] = set()
+
+    for lat, lon, _ in points:
+        gh = encode_geohash(lat, lon, precision)
+        if gh in seen_geohashes:
+            continue  # Already processed this tile for this lane
+        seen_geohashes.add(gh)
+
+        # Upsert the tile
+        cursor.execute(
+            "INSERT OR IGNORE INTO GEOHASH_TILE "
+            "(geohash, precision, min_x, min_y, max_x, max_y, version, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            (gh, precision, *geohash_bounds(gh), now)
+        )
+        cursor.execute("SELECT id FROM GEOHASH_TILE WHERE geohash = ?", (gh,))
+        tile_id = cursor.fetchone()[0]
+
+        # Link lane to tile
+        cursor.execute(
+            "INSERT OR IGNORE INTO GEOHASH_TILE_LANE (geohash_tile_id, lane_id) "
+            "VALUES (?, ?)",
+            (tile_id, lane_id)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cross-Section Definition
+# ---------------------------------------------------------------------------
+
+# Lane cross-section layout — ordered left to right when facing direction of travel.
+# Each entry defines one lane in the road cross-section.
+#
+# lateral_centre_m: signed offset from road centreline in metres
+#   negative = left of road centre, positive = right of road centre
+#
+# Road total width = 2*(2.5 shoulder) + 3*(3.7 driving) = 16.1 m
+# Offsets from road centre (positive = right):
+#   Left shoulder centre:   -(3*3.7/2 + 2.5/2) = -6.8  m
+#   Lane 1 centre:          -(3.7/2 + 3.7)     = -5.55 m  → -3.7*1.5 = -5.55
+#   Lane 2 centre:           0.0                m
+#   Lane 3 centre:          +5.55               m  → +3.7/2 + 3.7 = +5.55
+#   Right shoulder centre:  +6.8                m
+
+CROSS_SECTION = [
+    # (lane_type,  half_width_m, left_paint_type,  right_paint_type, lateral_centre_m)
+    # Lateral centre offsets from road centreline (negative = left, positive = right):
+    #   Left shoulder : -6.80 m  → edges at -8.05 m and -5.55 m
+    #   Lane 1        : -3.70 m  → edges at -5.55 m and -1.85 m
+    #   Lane 2        :  0.00 m  → edges at -1.85 m and +1.85 m
+    #   Lane 3        : +3.70 m  → edges at +1.85 m and +5.55 m
+    #   Right shoulder: +6.80 m  → edges at +5.55 m and +8.05 m
+    ("shoulder", 1.25, "solid_white",  "dashed_white",  -6.80),
+    ("driving",  1.85, "dashed_white", "dashed_white",  -3.70),
+    ("driving",  1.85, "dashed_white", "dashed_white",   0.00),
+    ("driving",  1.85, "dashed_white", "solid_white",   +3.70),
+    ("shoulder", 1.25, "dashed_white", "solid_white",   +6.80),
+]
+
+
+# ---------------------------------------------------------------------------
+# Road Segment Injectors
+# ---------------------------------------------------------------------------
+
+def inject_straight_segment(
+    conn: sqlite3.Connection,
+    start_lat: float,
+    start_lon: float,
+    bearing_deg: float,
+    length_m: float,
+    label: str,
+) -> tuple[float, float]:
+    """
+    Inject a full cross-section of lanes for a straight road segment.
+
+    Generates 5 lanes (left shoulder, 3 driving, right shoulder) with
+    1 m point density along the segment length.
+
+    Returns:
+        (end_lat, end_lon) — the road centreline endpoint, used to chain
+        the next segment's start position.
+    """
+    cursor = conn.cursor()
+    print(f"\n  [{label}] Straight {length_m:.0f} m, bearing {bearing_deg:.0f}°")
+
+    # Generate the road centreline points (used as reference for lane offsets)
+    road_centre_pts = straight_centreline_points(start_lat, start_lon, bearing_deg, length_m)
+    bearings = straight_bearings(bearing_deg, len(road_centre_pts))
+
+    for lane_type, half_w, left_paint, right_paint, lat_offset_m in CROSS_SECTION:
+        # Shift the road centreline laterally to find this lane's centreline
+        side   = "right" if lat_offset_m >= 0 else "left"
+        offset = abs(lat_offset_m)
+
+        lane_centre_pts = [
+            (*offset_wgs84(lat, lon, perpendicular_bearing(b, side), offset), st)
+            for (lat, lon, st), b in zip(road_centre_pts, bearings)
+        ]
+
+        # Left and right paint line boundaries offset from lane centre
+        left_pts  = offset_centreline(lane_centre_pts, bearings, half_w, "left")
+        right_pts = offset_centreline(lane_centre_pts, bearings, half_w, "right")
+
+        lane_id = insert_lane(
+            cursor, lane_centre_pts, left_pts, right_pts,
+            left_paint, right_paint, lane_type, length_m
+        )
+        assign_lane_to_tiles(cursor, lane_id, lane_centre_pts)
+        print(f"    → {lane_type:10s} lane_id={lane_id}  points={len(lane_centre_pts)}")
+
+    conn.commit()
+
+    # Return the road centreline endpoint for chaining
+    end_lat, end_lon, _ = road_centre_pts[-1]
+    return end_lat, end_lon
+
+
+def inject_arc_segment(
+    conn: sqlite3.Connection,
+    start_lat: float,
+    start_lon: float,
+    start_bearing_deg: float,
+    turn_angle_deg: float,
+    radius_m: float,
+    label: str,
+) -> tuple[float, float, float]:
+    """
+    Inject a full cross-section of lanes for a curved road segment.
+
+    The arc is defined by its radius and total turn angle. Each lane's
+    centreline is a concentric arc offset laterally from the road centre.
+    Because each lane has a different radius, inner lanes have fewer points
+    than outer lanes (arc length ∝ radius) — the 1 m density is preserved
+    per-lane by computing point counts from each lane's actual arc length.
+
+    Args:
+        turn_angle_deg: positive = right turn, negative = left turn
+        radius_m      : radius of the road centreline arc
+
+    Returns:
+        (end_lat, end_lon, end_bearing_deg) for chaining the next segment.
+    """
+    cursor = conn.cursor()
+    arc_length_m = abs(math.radians(turn_angle_deg)) * radius_m
+    print(f"\n  [{label}] Arc {turn_angle_deg:.0f}° turn, R={radius_m:.0f} m, "
+          f"arc length ≈ {arc_length_m:.1f} m, bearing {start_bearing_deg:.0f}°")
+
+    # Generate the road centreline arc
+    road_centre_pts, end_lat, end_lon, end_bearing = arc_centreline_points(
+        start_lat, start_lon, start_bearing_deg, turn_angle_deg, radius_m
+    )
+    bearings = arc_bearings(start_bearing_deg, turn_angle_deg, len(road_centre_pts))
+
+    for lane_type, half_w, left_paint, right_paint, lat_offset_m in CROSS_SECTION:
+        side   = "right" if lat_offset_m >= 0 else "left"
+        offset = abs(lat_offset_m)
+
+        # Each lane has a unique radius depending on its position relative to the
+        # centre of curvature. For a right turn the centre is to the right, so
+        # lanes left of road centre are farther away (larger radius) and lanes
+        # right of road centre are closer (smaller radius). The sign of
+        # turn_angle_deg determines which side the centre falls on.
+        turn_sign = 1 if turn_angle_deg > 0 else -1
+        lane_radius = radius_m - (lat_offset_m * turn_sign)
+        lane_arc_length = abs(math.radians(turn_angle_deg)) * lane_radius
+
+        # Re-generate arc points at the lane's own radius for correct 1 m spacing
+        lane_centre_pts, _, _, _ = arc_centreline_points(
+            *offset_wgs84(start_lat, start_lon,
+                          perpendicular_bearing(start_bearing_deg, side), offset),
+            start_bearing_deg, turn_angle_deg, lane_radius
+        )
+        lane_bearings = arc_bearings(start_bearing_deg, turn_angle_deg, len(lane_centre_pts))
+
+        left_pts  = offset_centreline(lane_centre_pts, lane_bearings, half_w, "left")
+        right_pts = offset_centreline(lane_centre_pts, lane_bearings, half_w, "right")
+
+        lane_id = insert_lane(
+            cursor, lane_centre_pts, left_pts, right_pts,
+            left_paint, right_paint, lane_type, lane_arc_length
+        )
+        assign_lane_to_tiles(cursor, lane_id, lane_centre_pts)
+        print(f"    → {lane_type:10s} lane_id={lane_id}  points={len(lane_centre_pts)}  "
+              f"R={lane_radius:.1f} m")
+
+    conn.commit()
+    return end_lat, end_lon, end_bearing
+
+
+# ---------------------------------------------------------------------------
+# Road Network
+# ---------------------------------------------------------------------------
+
+def inject_road_network(conn: sqlite3.Connection) -> None:
+    """
+    Inject the full connected road network into the database.
+
+    The three segments connect end-to-end: the endpoint of each segment
+    becomes the start point of the next, ensuring geometric continuity.
+    The road centreline arc endpoint drives the transition bearing, so
+    the straight sections emerge at exactly the right heading post-curve.
+
+    Network layout (top-down view):
+
+        Seg 1 (N↑)
+           |
+           └──── Seg 2 (90° right curve)
+                              ────── Seg 3 (E→)
+    """
+    # Anchor point: SF Market St & 5th St
+    ORIGIN_LAT = 37.784100
+    ORIGIN_LON = -122.407500
+
+    print("Injecting road network...")
+
+    # Segment 1 — Straight, heading north
+    end_lat, end_lon = inject_straight_segment(
+        conn,
+        start_lat=ORIGIN_LAT,
+        start_lon=ORIGIN_LON,
+        bearing_deg=0.0,
+        length_m=300.0,
+        label="Segment 1 — Straight North"
+    )
+
+    # Segment 2 — 90° right-hand curve (north → east), radius 150 m
+    end_lat, end_lon, end_bearing = inject_arc_segment(
+        conn,
+        start_lat=end_lat,
+        start_lon=end_lon,
+        start_bearing_deg=0.0,
+        turn_angle_deg=90.0,
+        radius_m=150.0,
+        label="Segment 2 — Right Curve N→E"
+    )
+
+    # Segment 3 — Straight, heading east (bearing inherited from curve endpoint)
+    inject_straight_segment(
+        conn,
+        start_lat=end_lat,
+        start_lon=end_lon,
+        bearing_deg=end_bearing,
+        length_m=300.0,
+        label="Segment 3 — Straight East"
+    )
+
+    print("\nRoad network injection complete.")
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Inject HD map road network data into an existing SQLite database."
+    )
+    parser.add_argument(
+        "--db", default="sample_map.db",
+        help="Path to the SQLite .db file (default: sample_map.db)"
+    )
+    args = parser.parse_args()
+
+    print(f"Opening database: {args.db}")
+    conn = sqlite3.connect(args.db)
+
+    try:
+        inject_road_network(conn)
+    finally:
+        conn.close()
+
+    print(f"\nDone. Data written to: {args.db}")
+
+
+if __name__ == "__main__":
+    main()
